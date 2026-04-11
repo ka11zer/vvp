@@ -1,75 +1,88 @@
 import requests
+import re
+import base64
 import urllib.parse
 from playwright.sync_api import sync_playwright
 
 API_URL = "https://api.ppv.to/api/streams"
 
-API_HEADERS = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
     "Referer": "https://ppv.to/",
     "Origin": "https://ppv.to"
 }
-
-# 🔥 IMPORTANT: REMOVE if using GitHub
-PROXY = ""  # or your proxy if running locally
 
 OUTPUT_FILE = "ppv.m3u"
 
 
 # ---------------------------
-# GET EVENTS
+# API
 # ---------------------------
 def get_events():
+    r = requests.get(API_URL, headers=HEADERS, timeout=10)
+    data = r.json()
+
+    events = []
+
+    for cat in data.get("streams", []):
+        for s in cat.get("streams", []):
+            if s.get("iframe"):
+                events.append({
+                    "name": s.get("name"),
+                    "embed": s.get("iframe"),
+                    "group": cat.get("category")
+                })
+
+    return events
+
+
+# ---------------------------
+# LIGHTWEIGHT EXTRACTOR
+# ---------------------------
+def extract_fast(url):
     try:
-        r = requests.get(API_URL, headers=API_HEADERS, timeout=10)
-        data = r.json()
+        r = requests.get(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://pooembed.eu/"
+        }, timeout=10)
 
-        events = []
+        html = r.text
 
-        for cat in data.get("streams", []):
-            category = cat.get("category", "PPV")
+        # direct m3u8
+        m = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', html)
+        if m:
+            return m[0]
 
-            for s in cat.get("streams", []):
-                iframe = s.get("iframe")
-                name = s.get("name")
+        # base64
+        b64 = re.findall(r'atob\("([^"]+)"\)', html)
+        for b in b64:
+            try:
+                decoded = base64.b64decode(b).decode()
+                if ".m3u8" in decoded:
+                    m = re.search(r'https?://[^"\']+\.m3u8[^"\']*', decoded)
+                    if m:
+                        return m.group(0)
+            except:
+                pass
 
-                if iframe:
-                    events.append({
-                        "name": name,
-                        "embed": iframe,
-                        "category": category
-                    })
+    except:
+        pass
 
-        print(f"Found {len(events)} events")
-        return events
-
-    except Exception as e:
-        print("API error:", e)
-        return []
-
-
-# ---------------------------
-# STEALTH
-# ---------------------------
-def stealth(page):
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    """)
+    return None
 
 
 # ---------------------------
-# EXTRACT
+# PLAYWRIGHT FALLBACK
 # ---------------------------
-def extract(page, url):
-    stream_url = None
+def extract_browser(page, url):
+    stream = None
 
-    def handle_response(response):
-        nonlocal stream_url
+    def handler(response):
+        nonlocal stream
         if ".m3u8" in response.url:
-            stream_url = response.url
+            stream = response.url
 
-    page.on("response", handle_response)
+    page.on("response", handler)
 
     try:
         page.goto(url, timeout=20000)
@@ -81,7 +94,7 @@ def extract(page, url):
 
         page.wait_for_timeout(8000)
 
-        return stream_url
+        return stream
 
     except:
         return None
@@ -92,12 +105,9 @@ def extract(page, url):
 # ---------------------------
 def main():
     events = get_events()
-
-    if not events:
-        return
+    print(f"Found {len(events)} events")
 
     results = []
-    failed = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -106,29 +116,29 @@ def main():
         )
 
         context = browser.new_context()
-
         page = context.new_page()
-        stealth(page)
 
         for i, ev in enumerate(events, 1):
-            url = extract(page, ev["embed"])
+            print(f"[{i}] {ev['name']}")
 
-            if not url:
-                failed += 1
-                print(f"[{i}] ✗ {ev['name']}")
+            # 🔥 try fast first
+            stream = extract_fast(ev["embed"])
+
+            # fallback to browser
+            if not stream:
+                stream = extract_browser(page, ev["embed"])
+
+            if not stream:
+                print("   ✗ failed")
                 continue
-
-            # proxy wrap (optional)
-            if PROXY:
-                url = PROXY + urllib.parse.quote(url, safe='')
 
             results.append({
                 "name": ev["name"],
-                "group": ev["category"],
-                "url": url
+                "group": ev["group"],
+                "url": stream
             })
 
-            print(f"[{i}] ✓ {ev['name']}")
+            print("   ✓ success")
 
         browser.close()
 
@@ -144,8 +154,7 @@ def main():
             f.write("#EXTVLCOPT:http-origin=https://pooembed.eu\n")
             f.write(r["url"] + "\n")
 
-    print("\n" + "="*40)
-    print(f"DONE: {len(results)} working / {failed} failed / {len(events)} total")
+    print(f"\nDONE: {len(results)} working")
 
 
 if __name__ == "__main__":
