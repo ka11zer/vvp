@@ -1,5 +1,6 @@
 import requests
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 
@@ -12,8 +13,11 @@ API_HEADERS = {
     "Origin": "https://ppv.to"
 }
 
+# 🔥 YOUR PROXY (change if needed)
+PROXY = "http://192.168.1.101:8090/stream?url="
+
 OUTPUT_FILE = "ppv.m3u"
-MAX_WORKERS = 4  # keep low for GitHub
+MAX_WORKERS = 5
 
 
 # ---------------------------
@@ -49,63 +53,59 @@ def get_events():
 
 
 # ---------------------------
-# EXTRACT USING PLAYWRIGHT
+# STEALTH PATCH
 # ---------------------------
-def extract_with_browser(embed_url):
+def stealth_page(page):
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    """)
+
+
+# ---------------------------
+# EXTRACT (FAST + STEALTH)
+# ---------------------------
+def process_event(context, ev):
+    page = context.new_page()
+    stealth_page(page)
+
+    stream_url = None
+
+    def handle_response(response):
+        nonlocal stream_url
+        if ".m3u8" in response.url:
+            stream_url = response.url
+
+    page.on("response", handle_response)
+
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        page.goto(ev["embed"], timeout=20000)
 
-            stream_url = None
+        # simulate user interaction
+        try:
+            page.click("body")
+        except:
+            pass
 
-            def handle_request(request):
-                nonlocal stream_url
-                url = request.url
-                if ".m3u8" in url:
-                    stream_url = url
+        page.wait_for_timeout(8000)
 
-            page.on("request", handle_request)
+        page.close()
 
-            page.goto(embed_url, timeout=15000)
-            page.wait_for_timeout(5000)
+        if not stream_url:
+            return None
 
-            browser.close()
+        # 🔥 proxy wrap
+        encoded = urllib.parse.quote(stream_url, safe='')
+        proxied = PROXY + encoded
 
-            return stream_url
+        return {
+            "name": ev["name"],
+            "group": ev["category"],
+            "url": proxied
+        }
 
     except:
+        page.close()
         return None
-
-
-# ---------------------------
-# VALIDATE STREAM
-# ---------------------------
-def validate_stream(url):
-    try:
-        r = requests.get(url, timeout=5)
-        return r.status_code == 200
-    except:
-        return False
-
-
-# ---------------------------
-# PROCESS EVENT
-# ---------------------------
-def process_event(ev):
-    url = extract_with_browser(ev["embed"])
-
-    if not url:
-        return None
-
-    if not validate_stream(url):
-        return None
-
-    return {
-        "name": ev["name"],
-        "group": ev["category"],
-        "url": url
-    }
 
 
 # ---------------------------
@@ -121,24 +121,43 @@ def main():
     results = []
     failed = 0
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_event, ev): ev for ev in events}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
 
-        for i, future in enumerate(as_completed(futures), 1):
-            ev = futures[future]
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            viewport={"width": 1280, "height": 720}
+        )
 
-            try:
-                res = future.result()
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(process_event, context, ev): ev
+                for ev in events
+            }
 
-                if res:
-                    results.append(res)
-                    print(f"[{i}] ✓ {res['name']}")
-                else:
+            for i, future in enumerate(as_completed(futures), 1):
+                ev = futures[future]
+
+                try:
+                    res = future.result()
+
+                    if res:
+                        results.append(res)
+                        print(f"[{i}] ✓ {res['name']}")
+                    else:
+                        failed += 1
+                        print(f"[{i}] ✗ {ev['name']}")
+
+                except:
                     failed += 1
-                    print(f"[{i}] ✗ {ev['name']}")
 
-            except:
-                failed += 1
+        browser.close()
 
     # ---------------------------
     # WRITE M3U
