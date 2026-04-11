@@ -1,16 +1,16 @@
-name: Update IPTV Playlist
+name: Update PPV Playlist
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
-  workflow_dispatch:         # manual trigger button
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -19,16 +19,21 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
 
       - name: Run script
         run: python script.py
 
-      - name: Commit updated playlist
+      - name: Commit playlist
         run: |
           git config --global user.name "iptv-bot"
           git config --global user.email "bot@github.com"
 
-          git add cdn-live.m3u
-          git commit -m "update playlist" || echo "no changes"
-          git push
+          if [ -f ppv.m3u ]; then
+            git add ppv.m3u
+            git commit -m "update playlist" || echo "no changes"
+            git push
+          else
+            echo "No playlist generated"
