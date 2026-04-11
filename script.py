@@ -1,8 +1,7 @@
-import re
 import requests
-import base64
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import sync_playwright
 
 API_URL = "https://api.ppv.to/api/streams"
 
@@ -13,109 +12,12 @@ API_HEADERS = {
     "Origin": "https://ppv.to"
 }
 
-EMBED_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://pooembed.eu/",
-    "Origin": "https://pooembed.eu"
-}
-
 OUTPUT_FILE = "ppv.m3u"
-MAX_WORKERS = 6
+MAX_WORKERS = 4  # keep low for GitHub
 
 
 # ---------------------------
-# BASE64
-# ---------------------------
-def decode_b64(s):
-    try:
-        s = s.replace('-', '+').replace('_', '/')
-        while len(s) % 4:
-            s += '='
-        return base64.b64decode(s).decode()
-    except:
-        return ""
-
-
-# ---------------------------
-# UNPACK JS (doms9-style)
-# ---------------------------
-def unpack_js(packed):
-    try:
-        payload, symtab, radix, count = re.search(
-            r"}\('(.*)',(\d+),(\d+),'(.*)'\.split\('\|'\)",
-            packed, re.DOTALL
-        ).groups()
-
-        radix = int(radix)
-        symtab = symtab.split('|')
-
-        def lookup(match):
-            word = match.group(0)
-            try:
-                return symtab[int(word, radix)]
-            except:
-                return word
-
-        return re.sub(r'\b\w+\b', lookup, payload)
-
-    except:
-        return packed
-
-
-# ---------------------------
-# VALIDATE STREAM
-# ---------------------------
-def validate_stream(url):
-    try:
-        r = requests.get(url, headers=EMBED_HEADERS, timeout=5)
-        return r.status_code == 200
-    except:
-        return False
-
-
-# ---------------------------
-# HEAVY EXTRACTOR
-# ---------------------------
-def extract_m3u8(embed_url):
-    try:
-        r = requests.get(embed_url, headers=EMBED_HEADERS, timeout=10)
-        html = r.text
-
-        # 1. direct
-        m = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', html)
-        if m:
-            return m[0]
-
-        # 2. packed JS
-        packed_list = re.findall(r'eval\(function\(p,a,c,k,e,d\).*?\)\)', html, re.DOTALL)
-        for packed in packed_list:
-            unpacked = unpack_js(packed)
-            m = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', unpacked)
-            if m:
-                return m[0]
-
-        # 3. base64
-        b64_list = re.findall(r'atob\("([^"]+)"\)', html)
-        for b64 in b64_list:
-            decoded = decode_b64(b64)
-            if ".m3u8" in decoded:
-                m = re.search(r'https?://[^"\']+\.m3u8[^"\']*', decoded)
-                if m:
-                    return m.group(0)
-
-        # 4. jwplayer
-        jw = re.search(r'file\s*:\s*"([^"]+\.m3u8[^"]*)"', html)
-        if jw:
-            return jw.group(1)
-
-    except:
-        pass
-
-    return None
-
-
-# ---------------------------
-# GET EVENTS FROM API
+# GET EVENTS
 # ---------------------------
 def get_events():
     try:
@@ -147,23 +49,63 @@ def get_events():
 
 
 # ---------------------------
+# EXTRACT USING PLAYWRIGHT
+# ---------------------------
+def extract_with_browser(embed_url):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            stream_url = None
+
+            def handle_request(request):
+                nonlocal stream_url
+                url = request.url
+                if ".m3u8" in url:
+                    stream_url = url
+
+            page.on("request", handle_request)
+
+            page.goto(embed_url, timeout=15000)
+            page.wait_for_timeout(5000)
+
+            browser.close()
+
+            return stream_url
+
+    except:
+        return None
+
+
+# ---------------------------
+# VALIDATE STREAM
+# ---------------------------
+def validate_stream(url):
+    try:
+        r = requests.get(url, timeout=5)
+        return r.status_code == 200
+    except:
+        return False
+
+
+# ---------------------------
 # PROCESS EVENT
 # ---------------------------
 def process_event(ev):
-    for _ in range(2):  # retry
-        url = extract_m3u8(ev["embed"])
+    url = extract_with_browser(ev["embed"])
 
-        if not url:
-            continue
+    if not url:
+        return None
 
-        if validate_stream(url):
-            return {
-                "name": ev["name"],
-                "group": ev["category"],
-                "url": url
-            }
+    if not validate_stream(url):
+        return None
 
-    return None
+    return {
+        "name": ev["name"],
+        "group": ev["category"],
+        "url": url
+    }
 
 
 # ---------------------------
