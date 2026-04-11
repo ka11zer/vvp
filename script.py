@@ -1,7 +1,5 @@
 import requests
-import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 
 API_URL = "https://api.ppv.to/api/streams"
@@ -13,11 +11,10 @@ API_HEADERS = {
     "Origin": "https://ppv.to"
 }
 
-# 🔥 YOUR PROXY (change if needed)
-PROXY = "http://192.168.1.101:8090/stream?url="
+# 🔥 IMPORTANT: REMOVE if using GitHub
+PROXY = ""  # or your proxy if running locally
 
 OUTPUT_FILE = "ppv.m3u"
-MAX_WORKERS = 5
 
 
 # ---------------------------
@@ -53,21 +50,18 @@ def get_events():
 
 
 # ---------------------------
-# STEALTH PATCH
+# STEALTH
 # ---------------------------
-def stealth_page(page):
+def stealth(page):
     page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     """)
 
 
 # ---------------------------
-# EXTRACT (FAST + STEALTH)
+# EXTRACT
 # ---------------------------
-def process_event(context, ev):
-    page = context.new_page()
-    stealth_page(page)
-
+def extract(page, url):
     stream_url = None
 
     def handle_response(response):
@@ -78,9 +72,8 @@ def process_event(context, ev):
     page.on("response", handle_response)
 
     try:
-        page.goto(ev["embed"], timeout=20000)
+        page.goto(url, timeout=20000)
 
-        # simulate user interaction
         try:
             page.click("body")
         except:
@@ -88,23 +81,9 @@ def process_event(context, ev):
 
         page.wait_for_timeout(8000)
 
-        page.close()
-
-        if not stream_url:
-            return None
-
-        # 🔥 proxy wrap
-        encoded = urllib.parse.quote(stream_url, safe='')
-        proxied = PROXY + encoded
-
-        return {
-            "name": ev["name"],
-            "group": ev["category"],
-            "url": proxied
-        }
+        return stream_url
 
     except:
-        page.close()
         return None
 
 
@@ -115,7 +94,6 @@ def main():
     events = get_events()
 
     if not events:
-        print("No events found")
         return
 
     results = []
@@ -124,38 +102,33 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled"
-            ]
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
         )
 
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            viewport={"width": 1280, "height": 720}
-        )
+        context = browser.new_context()
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(process_event, context, ev): ev
-                for ev in events
-            }
+        page = context.new_page()
+        stealth(page)
 
-            for i, future in enumerate(as_completed(futures), 1):
-                ev = futures[future]
+        for i, ev in enumerate(events, 1):
+            url = extract(page, ev["embed"])
 
-                try:
-                    res = future.result()
+            if not url:
+                failed += 1
+                print(f"[{i}] ✗ {ev['name']}")
+                continue
 
-                    if res:
-                        results.append(res)
-                        print(f"[{i}] ✓ {res['name']}")
-                    else:
-                        failed += 1
-                        print(f"[{i}] ✗ {ev['name']}")
+            # proxy wrap (optional)
+            if PROXY:
+                url = PROXY + urllib.parse.quote(url, safe='')
 
-                except:
-                    failed += 1
+            results.append({
+                "name": ev["name"],
+                "group": ev["category"],
+                "url": url
+            })
+
+            print(f"[{i}] ✓ {ev['name']}")
 
         browser.close()
 
