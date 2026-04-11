@@ -2,34 +2,48 @@ import requests
 import re
 import time
 
-API_URL = "https://ppv.cx/api"
+API_URL = "https://api.ppv.to/api/streams"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://pooembed.eu/"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://ppv.to/",
+    "Origin": "https://ppv.to"
 }
 
 OUTPUT_FILE = "ppv.m3u"
 
 
 # ---------------------------
-# GET EVENTS FROM API
+# GET EVENTS
 # ---------------------------
 def get_events():
     try:
         r = requests.get(API_URL, headers=HEADERS, timeout=10)
+
+        if r.status_code != 200:
+            print("Bad status:", r.status_code)
+            print(r.text[:200])
+            return []
+
         data = r.json()
 
+        streams = data.get("streams", [])
         events = []
 
-        for item in data:
-            title = item.get("title") or item.get("name")
-            embed = item.get("embed") or item.get("url")
+        for category in streams:
+            cat_name = category.get("category_name", "PPV")
 
-            if embed:
-                events.append({
-                    "name": title,
-                    "embed": embed
-                })
+            for item in category.get("streams", []):
+                name = item.get("name")
+                iframe = item.get("iframe")
+
+                if iframe:
+                    events.append({
+                        "name": name,
+                        "embed": iframe,
+                        "category": cat_name
+                    })
 
         print(f"Found {len(events)} events")
         return events
@@ -40,22 +54,20 @@ def get_events():
 
 
 # ---------------------------
-# EXTRACT M3U8 FROM EMBED
+# EXTRACT M3U8
 # ---------------------------
 def extract_m3u8(embed_url):
     try:
         r = requests.get(embed_url, headers=HEADERS, timeout=10)
         html = r.text
 
-        # Primary: direct m3u8
-        match = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', html)
+        matches = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', html)
 
-        if match:
-            # prefer index.m3u8
-            for m in match:
+        if matches:
+            for m in matches:
                 if "index.m3u8" in m:
                     return m
-            return match[0]
+            return matches[0]
 
     except Exception:
         pass
@@ -83,13 +95,14 @@ def main():
         if m3u8:
             results.append({
                 "name": ev["name"],
-                "url": m3u8
+                "url": m3u8,
+                "group": ev["category"]
             })
-            print("   ✓ Found stream")
+            print("   ✓ stream found")
         else:
-            print("   ✗ No stream")
+            print("   ✗ failed")
 
-        time.sleep(0.5)  # small delay (important)
+        time.sleep(0.5)
 
     # ---------------------------
     # WRITE M3U
@@ -98,15 +111,15 @@ def main():
         f.write("#EXTM3U\n")
 
         for r in results:
-            f.write(f'#EXTINF:-1 group-title="PPV",{r["name"]}\n')
+            f.write(f'#EXTINF:-1 group-title="{r["group"]}",{r["name"]}\n')
 
-            # critical headers
+            # IMPORTANT headers
             f.write("#EXTVLCOPT:http-referrer=https://pooembed.eu/\n")
             f.write("#EXTVLCOPT:http-origin=https://pooembed.eu\n")
 
             f.write(r["url"] + "\n")
 
-    print(f"\nDONE: {len(results)} working streams saved to {OUTPUT_FILE}")
+    print(f"\nDONE: {len(results)} streams saved")
 
 
 if __name__ == "__main__":
