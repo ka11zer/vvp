@@ -1,38 +1,73 @@
 import asyncio
+import re
+import time
 import requests
 from playwright.async_api import async_playwright
 
-API_URL = "https://api.ppv.to/api/streams"
+API_MIRRORS = [
+    "https://api.ppv.to/api/streams",
+    "https://api.ppv.cx/api/streams",
+]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+
+# ── Fix stream URL ───────────────────────────────
+
+def fix_url(url: str) -> str:
+    return re.sub(r"index\.m3u8$", "tracks-v1a1/mono.ts.m3u8", url, flags=re.I)
 
 
-# ── Step 1: Fetch API ─────────────────────────────
+# ── Fetch API with retry + fallback ─────────────
 
 def get_streams():
-    r = requests.get(API_URL, headers=HEADERS)
-    data = r.json()
+    for attempt in range(3):
+        for url in API_MIRRORS:
+            try:
+                print(f"[API] Trying: {url} (attempt {attempt+1})")
 
-    streams = []
+                r = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/json"
+                    },
+                    timeout=10
+                )
 
-    for category in data.get("streams", []):
-        for s in category.get("streams", []):
-            streams.append({
-                "name": s["name"],
-                "iframe": s["iframe"]
-            })
+                if r.status_code != 200:
+                    print(f"[API] Failed {url}: {r.status_code}")
+                    continue
 
-    print(f"Found {len(streams)} streams")
-    return streams
+                data = r.json()
+
+                streams = []
+
+                for category in data.get("streams", []):
+                    for s in category.get("streams", []):
+                        if not s.get("iframe"):
+                            continue
+
+                        streams.append({
+                            "name": s["name"],
+                            "iframe": s["iframe"],
+                            "logo": s.get("poster", "")
+                        })
+
+                print(f"[API] Loaded {len(streams)} streams from {url}")
+                return streams
+
+            except Exception as e:
+                print(f"[API] Error with {url}: {e}")
+                time.sleep(2)
+
+    print("[API] All mirrors failed")
+    return []
 
 
-# ── Step 2: Extract m3u8 using Playwright ────────
+# ── Extract m3u8 via Playwright ─────────────────
 
 async def extract_stream(browser, stream):
     context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        user_agent="Mozilla/5.0",
         extra_http_headers={
             "Referer": stream["iframe"],
             "Origin": "https://pooembed.eu"
@@ -44,7 +79,7 @@ async def extract_stream(browser, stream):
     try:
         await page.goto(stream["iframe"], timeout=30000)
 
-        # try clicking player (some streams need interaction)
+        # trigger player
         try:
             await page.mouse.click(640, 360)
         except:
@@ -56,7 +91,7 @@ async def extract_stream(browser, stream):
         except:
             pass
 
-        # wait for player object
+        # wait for player
         try:
             await page.wait_for_function(
                 "() => window.clapprPlayer || window.player",
@@ -65,17 +100,14 @@ async def extract_stream(browser, stream):
         except:
             pass
 
-        # small delay to allow stream to initialize
         await page.wait_for_timeout(3000)
 
         m3u8 = None
 
-        # multiple extraction methods
         for expr in [
             "() => window.clapprPlayer?.options?.source",
             "() => window.player?.options?.source",
             "() => document.querySelector('video')?.src",
-            "() => document.querySelector('source')?.src"
         ]:
             try:
                 val = await page.evaluate(expr)
@@ -86,14 +118,17 @@ async def extract_stream(browser, stream):
                 pass
 
         if m3u8:
+            fixed = fix_url(m3u8)
             print(f"[OK] {stream['name']}")
             return {
                 "name": stream["name"],
-                "url": m3u8
+                "url": fixed,
+                "logo": stream["logo"],
+                "referer": stream["iframe"]
             }
-        else:
-            print(f"[FAIL] {stream['name']}")
-            return None
+
+        print(f"[FAIL] {stream['name']}")
+        return None
 
     except Exception as e:
         print(f"[ERR] {stream['name']} -> {e}")
@@ -104,7 +139,7 @@ async def extract_stream(browser, stream):
         await context.close()
 
 
-# ── Step 3: Build M3U ────────────────────────────
+# ── Build M3U ───────────────────────────────────
 
 def build_m3u(results):
     m3u = "#EXTM3U\n"
@@ -113,19 +148,30 @@ def build_m3u(results):
         if not r:
             continue
 
-        m3u += f"#EXTINF:-1,{r['name']}\n"
+        m3u += (
+            f'#EXTINF:-1 tvg-logo="{r["logo"]}" group-title="PPV",{r["name"]}\n'
+        )
+
+        m3u += f'#EXTVLCOPT:http-referrer={r["referer"]}\n'
+        m3u += f'#EXTVLCOPT:http-origin={r["referer"]}\n'
+        m3u += f'#EXTVLCOPT:http-user-agent=Mozilla/5.0\n'
+
         m3u += f"{r['url']}\n"
 
-    with open("playlist.m3u", "w") as f:
+    with open("ppv.m3u", "w", encoding="utf-8") as f:
         f.write(m3u)
 
-    print("\nSaved playlist.m3u")
+    print("\nSaved ppv.m3u")
 
 
-# ── MAIN ─────────────────────────────────────────
+# ── MAIN ────────────────────────────────────────
 
 async def main():
     streams = get_streams()
+
+    if not streams:
+        print("No streams found. Exiting.")
+        return
 
     sem = asyncio.Semaphore(3)
 
