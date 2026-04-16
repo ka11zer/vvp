@@ -33,18 +33,31 @@ async def extract_stream(browser, stream):
     page = await browser.new_page()
 
     try:
-        await page.goto(stream["iframe"], timeout=20000)
+        await page.goto(stream["iframe"], timeout=30000)
 
-        # wait for player
-        await page.wait_for_timeout(5000)
+        # simulate user interaction (VERY important)
+        try:
+            await page.mouse.click(640, 360)
+        except:
+            pass
 
-        # try multiple methods
+        # wait for player to load properly
+        try:
+            await page.wait_for_function(
+                "() => window.clapprPlayer || window.player",
+                timeout=10000
+            )
+        except:
+            pass
+
         m3u8 = None
 
+        # try multiple extraction methods
         for expr in [
-            "window.clapprPlayer?.options?.source",
-            "window.player?.options?.source",
-            "document.querySelector('video')?.src"
+            "() => window.clapprPlayer?.options?.source",
+            "() => window.player?.options?.source",
+            "() => document.querySelector('video')?.src",
+            "() => document.querySelector('source')?.src"
         ]:
             try:
                 val = await page.evaluate(expr)
