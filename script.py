@@ -24,24 +24,39 @@ def get_streams():
                 "iframe": s["iframe"]
             })
 
+    print(f"Found {len(streams)} streams")
     return streams
 
 
 # ── Step 2: Extract m3u8 using Playwright ────────
 
 async def extract_stream(browser, stream):
-    page = await browser.new_page()
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        extra_http_headers={
+            "Referer": stream["iframe"],
+            "Origin": "https://pooembed.eu"
+        }
+    )
+
+    page = await context.new_page()
 
     try:
         await page.goto(stream["iframe"], timeout=30000)
 
-        # simulate user interaction (VERY important)
+        # try clicking player (some streams need interaction)
         try:
             await page.mouse.click(640, 360)
         except:
             pass
 
-        # wait for player to load properly
+        try:
+            btn = page.locator("button").first
+            await btn.click(timeout=3000)
+        except:
+            pass
+
+        # wait for player object
         try:
             await page.wait_for_function(
                 "() => window.clapprPlayer || window.player",
@@ -50,9 +65,12 @@ async def extract_stream(browser, stream):
         except:
             pass
 
+        # small delay to allow stream to initialize
+        await page.wait_for_timeout(3000)
+
         m3u8 = None
 
-        # try multiple extraction methods
+        # multiple extraction methods
         for expr in [
             "() => window.clapprPlayer?.options?.source",
             "() => window.player?.options?.source",
@@ -83,6 +101,7 @@ async def extract_stream(browser, stream):
 
     finally:
         await page.close()
+        await context.close()
 
 
 # ── Step 3: Build M3U ────────────────────────────
@@ -93,6 +112,7 @@ def build_m3u(results):
     for r in results:
         if not r:
             continue
+
         m3u += f"#EXTINF:-1,{r['name']}\n"
         m3u += f"{r['url']}\n"
 
@@ -107,10 +127,23 @@ def build_m3u(results):
 async def main():
     streams = get_streams()
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+    sem = asyncio.Semaphore(3)
 
-        tasks = [extract_stream(browser, s) for s in streams]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--autoplay-policy=no-user-gesture-required"
+            ]
+        )
+
+        async def limited(s):
+            async with sem:
+                return await extract_stream(browser, s)
+
+        tasks = [limited(s) for s in streams]
         results = await asyncio.gather(*tasks)
 
         await browser.close()
