@@ -1,161 +1,109 @@
+import asyncio
 import requests
-import re
-import base64
-import urllib.parse
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 API_URL = "https://api.ppv.to/api/streams"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://ppv.to/",
-    "Origin": "https://ppv.to"
+    "User-Agent": "Mozilla/5.0"
 }
 
-OUTPUT_FILE = "ppv.m3u"
 
+# ── Step 1: Fetch API ─────────────────────────────
 
-# ---------------------------
-# API
-# ---------------------------
-def get_events():
-    r = requests.get(API_URL, headers=HEADERS, timeout=10)
+def get_streams():
+    r = requests.get(API_URL, headers=HEADERS)
     data = r.json()
 
-    events = []
+    streams = []
 
-    for cat in data.get("streams", []):
-        for s in cat.get("streams", []):
-            if s.get("iframe"):
-                events.append({
-                    "name": s.get("name"),
-                    "embed": s.get("iframe"),
-                    "group": cat.get("category")
-                })
+    for category in data.get("streams", []):
+        for s in category.get("streams", []):
+            streams.append({
+                "name": s["name"],
+                "iframe": s["iframe"]
+            })
 
-    return events
+    return streams
 
 
-# ---------------------------
-# LIGHTWEIGHT EXTRACTOR
-# ---------------------------
-def extract_fast(url):
+# ── Step 2: Extract m3u8 using Playwright ────────
+
+async def extract_stream(browser, stream):
+    page = await browser.new_page()
+
     try:
-        r = requests.get(url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://pooembed.eu/"
-        }, timeout=10)
+        await page.goto(stream["iframe"], timeout=20000)
 
-        html = r.text
+        # wait for player
+        await page.wait_for_timeout(5000)
 
-        # direct m3u8
-        m = re.findall(r'https?://[^"\']+\.m3u8[^"\']*', html)
-        if m:
-            return m[0]
+        # try multiple methods
+        m3u8 = None
 
-        # base64
-        b64 = re.findall(r'atob\("([^"]+)"\)', html)
-        for b in b64:
+        for expr in [
+            "window.clapprPlayer?.options?.source",
+            "window.player?.options?.source",
+            "document.querySelector('video')?.src"
+        ]:
             try:
-                decoded = base64.b64decode(b).decode()
-                if ".m3u8" in decoded:
-                    m = re.search(r'https?://[^"\']+\.m3u8[^"\']*', decoded)
-                    if m:
-                        return m.group(0)
+                val = await page.evaluate(expr)
+                if val and ".m3u8" in val:
+                    m3u8 = val
+                    break
             except:
                 pass
 
-    except:
-        pass
+        if m3u8:
+            print(f"[OK] {stream['name']}")
+            return {
+                "name": stream["name"],
+                "url": m3u8
+            }
+        else:
+            print(f"[FAIL] {stream['name']}")
+            return None
 
-    return None
-
-
-# ---------------------------
-# PLAYWRIGHT FALLBACK
-# ---------------------------
-def extract_browser(page, url):
-    stream = None
-
-    def handler(response):
-        nonlocal stream
-        if ".m3u8" in response.url:
-            stream = response.url
-
-    page.on("response", handler)
-
-    try:
-        page.goto(url, timeout=20000)
-
-        try:
-            page.click("body")
-        except:
-            pass
-
-        page.wait_for_timeout(8000)
-
-        return stream
-
-    except:
+    except Exception as e:
+        print(f"[ERR] {stream['name']} -> {e}")
         return None
 
+    finally:
+        await page.close()
 
-# ---------------------------
-# MAIN
-# ---------------------------
-def main():
-    events = get_events()
-    print(f"Found {len(events)} events")
 
-    results = []
+# ── Step 3: Build M3U ────────────────────────────
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
-        )
+def build_m3u(results):
+    m3u = "#EXTM3U\n"
 
-        context = browser.new_context()
-        page = context.new_page()
+    for r in results:
+        if not r:
+            continue
+        m3u += f"#EXTINF:-1,{r['name']}\n"
+        m3u += f"{r['url']}\n"
 
-        for i, ev in enumerate(events, 1):
-            print(f"[{i}] {ev['name']}")
+    with open("playlist.m3u", "w") as f:
+        f.write(m3u)
 
-            # 🔥 try fast first
-            stream = extract_fast(ev["embed"])
+    print("\nSaved playlist.m3u")
 
-            # fallback to browser
-            if not stream:
-                stream = extract_browser(page, ev["embed"])
 
-            if not stream:
-                print("   ✗ failed")
-                continue
+# ── MAIN ─────────────────────────────────────────
 
-            results.append({
-                "name": ev["name"],
-                "group": ev["group"],
-                "url": stream
-            })
+async def main():
+    streams = get_streams()
 
-            print("   ✓ success")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
 
-        browser.close()
+        tasks = [extract_stream(browser, s) for s in streams]
+        results = await asyncio.gather(*tasks)
 
-    # ---------------------------
-    # WRITE M3U
-    # ---------------------------
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n")
+        await browser.close()
 
-        for r in results:
-            f.write(f'#EXTINF:-1 group-title="{r["group"]}",{r["name"]}\n')
-            f.write("#EXTVLCOPT:http-referrer=https://pooembed.eu/\n")
-            f.write("#EXTVLCOPT:http-origin=https://pooembed.eu\n")
-            f.write(r["url"] + "\n")
-
-    print(f"\nDONE: {len(results)} working")
+    build_m3u(results)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
